@@ -1,0 +1,152 @@
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: {{.ObjectMeta.Name}}
+  namespace: {{.ObjectMeta.Namespace}}
+  labels:
+    component: {{.ObjectMeta.Name}}
+spec:
+  serviceName: {{.ObjectMeta.Name}}
+  replicas: {{.Spec.Size}}
+  selector:
+    matchLabels:
+      component: {{.ObjectMeta.Name}}
+  template:
+    metadata:
+      name: {{.ObjectMeta.Name}}
+      labels:
+        component: {{.ObjectMeta.Name}}
+    spec:
+      volumes:
+        - name: etcd-storage
+          emptyDir: {}
+      initContainers:
+        - name: init-etcd
+          image: {{.Spec.Image}}
+          env:
+            - name: CLUSTER_SIZE
+              value: {{.Spec.Size}}
+            - name: SET_NAME
+              value: {{.ObjectMeta.Name}}
+            - name: SET_NAMESPACE
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.namespace
+            - name: CLUSTER_STATE
+              valueFrom:
+                configMapKeyRef:
+                  name: {{.ObjectMeta.Name}}
+                  key: cluster-state
+            - name: LAST_SIZE
+              valueFrom:
+                configMapKeyRef:
+                  key: last-size
+                  name: {{.ObjectMeta.Name}}
+          command:
+            - /bin/bash
+            - -ecx
+            - |
+              if [ ${CLUSTER_STATE} == "existing" ]; then
+                EPS=""
+                for i in $(seq 0 $((${LAST_SIZE} - 1))); do
+                  EPS="${EPS}${EPS:+,}http://${SET_NAME}-${i}.${SET_NAME}.${SET_NAMESPACE}.svc.cluster.local:2379"
+                done
+                EPS="http://etcdcluster.default.svc.cluster.local:2379"
+
+                HASH=`etcdctl --endpoints=${EPS} member list | grep -w true | awk '{ print $1}' | awk -F "," '{ print $1}'`
+                while [[ -n "${HASH}" ]]
+                do
+                  echo "promote"
+                  etcdctl --endpoints=${EPS} member promote ${HASH}
+                  sleep 1
+                  HASH=`etcdctl --endpoints=${EPS} member list | grep -w true | awk '{ print $1}' | awk -F "," '{ print $1}'`
+                done
+              
+                PEER=`etcdctl --endpoints=${EPS} member list | grep -w "http://${HOSTNAME}.${SET_NAME}.${SET_NAMESPACE}.svc.cluster.local:2380" | awk '{ print $1}' | awk -F "," '{ print $1}'`
+                if [[ -n "${PEER}" ]]; then
+                  etcdctl --endpoints=${EPS} member remove ${PEER}
+                fi
+                etcdctl --endpoints=${EPS} member add ${HOSTNAME} --peer-urls="http://${HOSTNAME}.${SET_NAME}.${SET_NAMESPACE}.svc.cluster.local:2380" --learner
+              fi
+      containers:
+        - name: etcd
+          image: {{.Spec.Image}}
+          ports:
+            - containerPort: 2379
+              name: client
+            - containerPort: 2380
+              name: peer
+          volumeMounts:
+            - name: etcd-storage
+              mountPath: /var/run/etcd/default.etcd
+          env:
+            - name: CLUSTER_SIZE
+              value: {{.Spec.Size}}
+            - name: SET_NAME
+              value: {{.ObjectMeta.Name}}
+            - name: SET_NAMESPACE
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.namespace
+            - name: CLUSTER_STATE
+              valueFrom:
+                configMapKeyRef:
+                  name: {{.ObjectMeta.Name}}
+                  key: cluster-state
+            - name: LAST_SIZE
+              valueFrom:
+                configMapKeyRef:
+                  key: last-size
+                  name: {{.ObjectMeta.Name}}
+          command:
+            - /bin/bash
+            - -ecx
+            - |
+              chmod -R 700 /var/run/etcd/default.etcd
+              if [ ${CLUSTER_STATE} == "existing" ]; then
+
+                SET_ID=${HOSTNAME##*-}
+              
+                PEERS="${HOSTNAME}=http://${HOSTNAME}.${SET_NAME}.${SET_NAMESPACE}.svc.cluster.local:2380"
+                for i in $(seq 0 $((${LAST_SIZE} - 1))); do
+                  PEERS="${PEERS}${PEERS:+,}${SET_NAME}-${i}=http://${SET_NAME}-${i}.${SET_NAME}.${SET_NAMESPACE}.svc.cluster.local:2380"
+                done
+                
+                etcd --name ${HOSTNAME} \
+                  --listen-peer-urls http://0.0.0.0:2380 \
+                  --listen-client-urls http://0.0.0.0:2379 \
+                  --advertise-client-urls http://${HOSTNAME}.${SET_NAME}.${SET_NAMESPACE}.svc.cluster.local:2379 \
+                  --initial-advertise-peer-urls http://${HOSTNAME}.${SET_NAME}.${SET_NAMESPACE}.svc.cluster.local:2380 \
+                  --initial-cluster-token etcd-cluster-1 \
+                  --initial-cluster ${PEERS} \
+                  --initial-cluster-state existing \
+                  --data-dir /var/run/etcd/default.etcd
+              else
+                PEERS=""
+                for i in $(seq 0 $((${CLUSTER_SIZE} - 1))); do
+                  PEERS="${PEERS}${PEERS:+,}${SET_NAME}-${i}=http://${SET_NAME}-${i}.${SET_NAME}.${SET_NAMESPACE}.svc.cluster.local:2380"
+                done
+                exec etcd --name ${HOSTNAME} \
+                  --listen-peer-urls http://0.0.0.0:2380 \
+                  --listen-client-urls http://0.0.0.0:2379 \
+                  --advertise-client-urls http://${HOSTNAME}.${SET_NAME}.${SET_NAMESPACE}.svc.cluster.local:2379 \
+                  --initial-advertise-peer-urls http://${HOSTNAME}.${SET_NAME}.${SET_NAMESPACE}.svc.cluster.local:2380 \
+                  --initial-cluster-token etcd-cluster-1 \
+                  --initial-cluster ${PEERS} \
+                  --initial-cluster-state new \
+                  --data-dir /var/run/etcd/default.etcd
+              fi
+          lifecycle:
+            preStop:
+              exec:
+                command:
+                  - /bin/bash
+                  - -ecx
+                  - |
+                    SET_ID=${HOSTNAME##*-}
+                    EPS=""
+                    for i in $(seq 0 ${SET_ID}); do
+                    EPS="${EPS}${EPS:+,}http://${SET_NAME}-${i}.${SET_NAME}.${SET_NAMESPACE}.svc.cluster.local:2379"
+                    done
+                    HASH=`etcdctl --endpoints=${EPS} member list | grep -w "$HOSTNAME" | awk '{ print $1}' | awk -F "," '{ print $1}'`
+                    etcdctl --endpoints=${EPS} member remove ${HASH}
