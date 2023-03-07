@@ -37,22 +37,18 @@ spec:
                 configMapKeyRef:
                   name: {{.ObjectMeta.Name}}
                   key: cluster-state
-            - name: LAST_SIZE
-              valueFrom:
-                configMapKeyRef:
-                  key: last-size
-                  name: {{.ObjectMeta.Name}}
           command:
             - /bin/bash
             - -ecx
             - |
               if [ ${CLUSTER_STATE} == "existing" ]; then
+                SET_ID=${HOSTNAME##*-}
+              
                 EPS=""
-                for i in $(seq 0 $((${LAST_SIZE} - 1))); do
+                for i in $(seq 0 $((${SET_ID} - 1))); do
                   EPS="${EPS}${EPS:+,}http://${SET_NAME}-${i}.${SET_NAME}.${SET_NAMESPACE}.svc.cluster.local:2379"
                 done
-                EPS="http://etcdcluster.default.svc.cluster.local:2379"
-
+              
                 HASH=`etcdctl --endpoints=${EPS} member list | grep -w true | awk '{ print $1}' | awk -F "," '{ print $1}'`
                 while [[ -n "${HASH}" ]]
                 do
@@ -62,6 +58,14 @@ spec:
                   HASH=`etcdctl --endpoints=${EPS} member list | grep -w true | awk '{ print $1}' | awk -F "," '{ print $1}'`
                 done
               
+                HEALTH=`etcdctl --write-out="table" --endpoints=${EPS} endpoint health | awk '{ print $4}' | grep true | wc -l`
+                while [ ${HEALTH} -lt ${SET_ID} ]
+                do
+                  echo "the cluster status is abnormal"
+                  sleep 1
+                  HEALTH=`etcdctl --write-out="table" --endpoints=${EPS} endpoint health | awk '{ print $4}' | grep true | wc -l`
+                done
+
                 PEER=`etcdctl --endpoints=${EPS} member list | grep -w "http://${HOSTNAME}.${SET_NAME}.${SET_NAMESPACE}.svc.cluster.local:2380" | awk '{ print $1}' | awk -F "," '{ print $1}'`
                 if [[ -n "${PEER}" ]]; then
                   etcdctl --endpoints=${EPS} member remove ${PEER}
@@ -93,11 +97,6 @@ spec:
                 configMapKeyRef:
                   name: {{.ObjectMeta.Name}}
                   key: cluster-state
-            - name: LAST_SIZE
-              valueFrom:
-                configMapKeyRef:
-                  key: last-size
-                  name: {{.ObjectMeta.Name}}
           command:
             - /bin/bash
             - -ecx
@@ -107,8 +106,8 @@ spec:
 
                 SET_ID=${HOSTNAME##*-}
               
-                PEERS="${HOSTNAME}=http://${HOSTNAME}.${SET_NAME}.${SET_NAMESPACE}.svc.cluster.local:2380"
-                for i in $(seq 0 $((${LAST_SIZE} - 1))); do
+                PEERS=""
+                for i in $(seq 0 ${SET_ID}); do
                   PEERS="${PEERS}${PEERS:+,}${SET_NAME}-${i}=http://${SET_NAME}-${i}.${SET_NAME}.${SET_NAMESPACE}.svc.cluster.local:2380"
                 done
                 
